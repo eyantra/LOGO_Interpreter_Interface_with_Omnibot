@@ -1,0 +1,4 @@
+to koch :n
+ifelse n<10 [fd :n] [fd :n/3 rt 60 koch :n/3 lt 120 koch :n/3 rt 60 fd :n/3]
+end
+

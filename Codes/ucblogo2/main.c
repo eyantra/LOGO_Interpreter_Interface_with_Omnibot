@@ -1,0 +1,232 @@
+/*
+ *      main.c          logo main procedure module              dvb
+ *
+ *	Copyright (C) 1993 by the Regents of the University of California
+ *
+ *      This program is free software; you can redistribute it and/or modify
+ *      it under the terms of the GNU General Public License as published by
+ *      the Free Software Foundation; either version 2 of the License, or
+ *      (at your option) any later version.
+ *
+ *      This program is distributed in the hope that it will be useful,
+ *      but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *      MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *      GNU General Public License for more details.
+ *
+ *      You should have received a copy of the GNU General Public License
+ *      along with this program; if not, write to the Free Software
+ *      Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ *
+ */
+
+#include "logo.h"
+#include "globals.h"
+
+#include <termio.h>
+
+#include <setjmp.h>
+jmp_buf iblk_buf;
+
+#include <unistd.h>
+
+NODE *current_line = NIL;
+NODE **bottom_stack; /*GC*/
+NODE *command_line = NIL; /* 6.0 command line args after files */
+
+int stop_quietly_flag = 0;
+
+void unblock_input(void) {
+	if (input_blocking) {
+		input_blocking = 0;
+		longjmp(iblk_buf, 1);
+	}
+}
+
+extern int in_eval_save;
+
+#define sig_arg 0
+RETSIGTYPE logo_stop(int sig) {
+	if (inside_gc || in_eval_save) {
+		int_during_gc = 1;
+	} else {
+		charmode_off();
+		to_pending = 0;
+		if (!stop_quietly_flag)
+			err_logo(STOP_ERROR, NIL);
+		stop_quietly_flag = 0;
+		signal(SIGINT, logo_stop);
+		unblock_input();
+	}
+SIGRET}
+
+#define sig_arg 0
+RETSIGTYPE logo_pause(int sig) {
+	if (inside_gc || in_eval_save) {
+		int_during_gc = 2;
+	} else {
+		charmode_off();
+		to_pending = 0;
+		signal(SIGQUIT, logo_pause);
+		lpause(NIL);
+	}
+SIGRET}
+
+#define sig_arg 0
+RETSIGTYPE mouse_down(int sig) {
+	NODE *line;
+
+	if (inside_gc || in_eval_save) {
+		if (int_during_gc == 0)
+			int_during_gc = 3;
+	} else {
+		line = valnode__caseobj(Buttonact);
+		if (line != UNBOUND && line != NIL) {
+			if (inside_evaluator) {
+				eval_buttonact = line;
+			} else {
+				eval_driver(line);
+				fix_turtle_shownness();
+			}
+		}
+	}
+SIGRET}
+
+int keyact_set() {
+	NODE *line;
+
+	line = valnode__caseobj(Keyact);
+	return (line != UNBOUND && line != NIL);
+}
+
+void do_keyact(int);
+
+#define sig_arg 0
+RETSIGTYPE delayed_keyact(int sig) {
+	do_keyact(readchar_lookahead_buf);
+SIGRET}
+
+void do_keyact(int ch) {
+	NODE *line;
+
+	readchar_lookahead_buf = ch;
+	if (inside_gc || in_eval_save) {
+		if (int_during_gc == 0)
+			int_during_gc = 4;
+	} else {
+		line = valnode__caseobj(Keyact);
+		if (line != UNBOUND && line != NIL) {
+			if (inside_evaluator) {
+				eval_buttonact = line;
+			} else {
+				eval_driver(line);
+				fix_turtle_shownness();
+			}
+		}
+	}
+}
+
+RETSIGTYPE (*intfuns[])() = { 0, logo_stop, logo_pause, mouse_down,
+		delayed_keyact };
+
+void delayed_int() {
+	(void) (*intfuns[int_during_gc])(0);
+}
+
+int main(int argc, char *argv[]) {
+	NODE *exec_list = NIL;
+	NODE *cl_tail = NIL;
+	int argc2;
+	char **argv2;
+
+	bottom_stack = &exec_list; /*GC*/
+
+
+	(void) addseg();
+	term_init();
+	init();
+
+	math_init();
+	my_init();
+
+	signal(SIGINT, logo_stop);
+
+	if (argc < 2) {
+		if (1 || isatty(1)) // fix this.  for interactive from menu bar.
+		{
+			char version[20];
+			lcleartext(NIL);
+			strcpy(version, "5.6");
+			ndprintf(stdout, message_texts[WELCOME_TO], version);
+			new_line(stdout);
+		}
+	}
+
+	setvalnode__caseobj(LogoVersion, make_floatnode(5.6));
+	setflag__caseobj(LogoVersion, VAL_BURIED);
+
+	argv2 = argv;
+	argc2 = argc;
+
+	if (!strcmp(*argv + strlen(*argv) - 4, "logo")) {
+		argv++;
+		while (--argc > 0 && strcmp(*argv, "-") && NOT_THROWING) {
+			argv++;
+		}
+	}
+
+	argv++;
+	while (--argc > 0) {
+		if (command_line == NIL)
+			cl_tail = command_line = cons(make_static_strnode(*argv++), NIL);
+		else {
+			setcdr(cl_tail, cons(make_static_strnode(*argv++), NIL));
+			cl_tail = cdr(cl_tail);
+		}
+	}
+
+	setvalnode__caseobj(CommandLine, command_line);
+
+	silent_load(Startuplg, logolib);
+	silent_load(Startup, NULL); /* load startup.lg */
+	if (!strcmp(*argv2 + strlen(*argv2) - 4, "logo")) {
+		argv2++;
+		while (--argc2 > 0 && strcmp(*argv2, "-") && NOT_THROWING) {
+			silent_load(NIL, *argv2++);
+		}
+	}
+
+	for (;;) {
+		if (NOT_THROWING) {
+			check_reserve_tank();
+			current_line = reader(stdin, "? ");
+
+			if (feof(stdin) && !isatty(0))
+				lbye(NIL);
+
+			if (NOT_THROWING) {
+				exec_list = parser(current_line, TRUE);
+				if (exec_list != NIL)
+					eval_driver(exec_list);
+			}
+		}
+		if (stopping_flag == THROWING) {
+			if (isName(throw_node, Name_error)) {
+				err_print(NULL);
+			} else if (isName(throw_node, Name_system))
+				break;
+			else if (!isName(throw_node, Name_toplevel)) {
+				err_logo(NO_CATCH_TAG, throw_node);
+				err_print(NULL);
+			}
+			stopping_flag = RUN;
+		}
+		if (stopping_flag == STOP || stopping_flag == OUTPUT) {
+			/*    ndprintf(stdout, "%t\n", message_texts[CANT_STOP]);   */
+			stopping_flag = RUN;
+		}
+	}
+	//prepare_to_exit(TRUE);
+	my_finish();
+	exit(0);
+	return 0;
+}
